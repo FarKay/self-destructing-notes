@@ -1,0 +1,11 @@
+# secrets
+.env
+
+# compiled programs
+*.exe
+/app
+
+# test output
+cover.out
+coverage.out
+coverage.html

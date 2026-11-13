@@ -1,0 +1,208 @@
+# Self-Destructing Notes
+
+A small API written in Go for sharing secrets safely. You write a note and get a link. The note is stored encrypted, can be read **exactly once**, and is deleted when it is read or when its timer runs out, whichever comes first.
+
+## What it does
+
+1. You send some text and choose how long it should live (from 1 minute up to 7 days).
+2. The server encrypts the text and gives you back a link with a random ID.
+3. Whoever you share the link with can read the note once.
+4. After that, or after the timer, the note is gone and the link returns "not found".
+
+Think of a letter in a sealed envelope that burns itself after it has been read.
+
+## API
+
+| Method | Route | What it does | Success | Errors |
+|---|---|---|---|---|
+| POST | `/notes` | Create a note. Body: `{"text": "...", "expires_in_minutes": 60}`. The expiry is optional and defaults to 60. | 201 with `id`, `url`, `expires_at` | 400 invalid input |
+| GET | `/notes/{id}` | Check that a note still exists. Does **not** consume it. | 200 with `exists` and `expires_at` | 404 |
+| POST | `/notes/{id}/read` | Return the text and destroy the note. | 200 with `text` | 404 |
+
+Missing, expired and already-read notes all return the same 404 on purpose, so nobody can tell them apart.
+
+Reading is a POST, not a GET. Chat apps, email scanners and browsers fetch links automatically to build previews, and a GET that destroyed the note would burn it before the real person opened it.
+
+## Web pages
+
+The app also has a simple browser interface, so nobody needs the API to use it.
+
+| Route | What it shows |
+|---|---|
+| `/` | A form to write a note, choose when it self-destructs, and get a link to share. |
+| `/n/{id}` | The page the recipient opens. It checks that the note exists and shows a **Reveal note** button. Clicking it reads the note (once) and destroys it. |
+
+Opening `/n/{id}` never touches the note. Only the button click does, so link previews cannot destroy it.
+
+The interface is a small React app styled with Tailwind CSS. The source is in `frontend/`. `npm run build` compiles it into the `web/` folder, which the Go program embeds with the `embed` package, so there is still only one file to deploy. The Go server returns the same page for `/` and `/n/{id}`, and the app reads the address to decide what to show.
+
+## Security design
+
+- **AES-256-GCM encryption.** The text is encrypted before it is stored. GCM also detects tampering.
+- **The key stays out of the data.** It comes from the `NOTES_KEY` environment variable and is never saved with the notes.
+- **Fresh nonce for every note**, from `crypto/rand`.
+- **Unguessable IDs.** 16 random bytes from `crypto/rand` (not `math/rand`, which is predictable).
+- **Read-once guarantee.** Looking up and deleting a note happen in one locked step, so two people opening the link at the same moment cannot both get it.
+- **Limits.** Request bodies are capped at 16 KB, notes at 10,000 bytes, and expiry at 7 days.
+- **Safe pages.** A Content Security Policy only lets the page run its own scripts and styles and blocks framing. React renders note text as plain text, never as HTML, so a note cannot inject code. Pages send `no-referrer` and `no-store` so links and notes are not leaked or cached.
+
+## Project structure
+
+| File | Purpose |
+|---|---|
+| `main.go` | Handlers, routes and startup. |
+| `store.go` | The `Note` model, the `Store` interface and the in-memory store with a background cleanup goroutine. |
+| `mongo.go` | The MongoDB store: TTL index and atomic find-and-delete. |
+| `crypto.go` | Encryption, key parsing and ID generation. |
+| `frontend/` | The React + Tailwind source (Vite project). Only needed to change the interface. |
+| `web/` | The built frontend (`npm run build` writes here). Embedded into the program and committed to Git. |
+| `app_test.go`, `crypto_test.go`, `store_test.go` | Tests. |
+
+The handlers only talk to the `Store` interface, so the storage can be swapped (for example to MongoDB) without changing them.
+
+## Requirements
+
+- [Go](https://go.dev/dl/) 1.22 or newer. The routing uses patterns like `"POST /notes/{id}/read"`, added in 1.22.
+- No external Go packages.
+- [Node.js](https://nodejs.org/) (LTS) only if you want to change or rebuild the frontend. Running the program does not need it, because the built files are already in `web/`.
+
+## Configuration
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `NOTES_KEY` | Yes | 32 random bytes, base64 encoded. Used to encrypt notes. |
+| `MONGO_URI` | No | MongoDB connection string. If set, notes are stored in MongoDB. If not set, they are kept in memory. |
+| `PORT` | No | Port to listen on. Defaults to `4000`. Hosting platforms set it for you. |
+| `BASE_URL` | No | Public address used in the `url` returned by `/notes`. Defaults to `http://localhost:<port>`. |
+
+Generate a key in PowerShell and set it for the current terminal:
+
+```
+$b = New-Object byte[] 32
+(New-Object System.Security.Cryptography.RNGCryptoServiceProvider).GetBytes($b)
+$env:NOTES_KEY = [Convert]::ToBase64String($b)
+```
+
+**Never commit the key.** If you change the key, notes created with the old one can no longer be decrypted.
+
+## Storage
+
+The app can keep notes in two places. It picks one at startup.
+
+| Mode | When | Behaviour |
+|---|---|---|
+| **MongoDB** | `MONGO_URI` is set | Notes survive restarts. Only the encrypted bytes are stored. A **TTL index** lets MongoDB delete each note when it expires, and reading uses an **atomic find-and-delete**, so exactly one reader can ever get a note, even across several copies of the server. |
+| **Memory** | `MONGO_URI` is not set | Notes are lost on restart. Good for trying the app locally. |
+
+To use MongoDB (PowerShell):
+
+```
+$env:MONGO_URI = "mongodb+srv://<user>:<password>@<cluster-host>/?appName=Cluster0"
+```
+
+The app creates the `selfdestructing_notes` database and its `notes` collection and index on first start. In Atlas, make sure your IP address is allowed under **Network Access** and the database user exists in the same project as the cluster.
+
+**With MongoDB, keep `NOTES_KEY` the same between runs.** Stored notes are encrypted with it, so a different key makes them unreadable.
+
+## Run
+
+```
+go run .
+```
+
+You should see `Self-destructing notes running on port 4000`.
+
+## Try it (PowerShell)
+
+```
+$r = Invoke-RestMethod -Method Post -Uri http://localhost:4000/notes -ContentType "application/json" -Body '{"text":"my secret","expires_in_minutes":10}'
+$r | Format-List
+
+Invoke-RestMethod http://localhost:4000/notes/$($r.id) | Format-List
+(Invoke-RestMethod -Method Post -Uri http://localhost:4000/notes/$($r.id)/read).text
+Invoke-RestMethod -Method Post -Uri http://localhost:4000/notes/$($r.id)/read
+```
+
+The second read returns a 404, which is the point: the note is gone.
+
+## Tests
+
+```
+go test
+go test -v
+go test -cover
+```
+
+The tests use `net/http/httptest`, so no server or port is needed. They cover the full create, check and read flow, input validation, expiry, encryption at rest, tamper detection, and 100 simultaneous readers where exactly one may succeed.
+
+The same store tests (`contract_test.go`) run against the in-memory store and against MongoDB. The MongoDB tests are skipped unless you point them at a database:
+
+```
+$env:MONGO_TEST_URI = "mongodb+srv://<user>:<password>@<cluster-host>/?appName=Cluster0"
+go test -v
+```
+
+They use a throwaway collection in a separate `selfdestructing_notes_test` database and delete it afterwards.
+
+## Frontend development
+
+The frontend lives in `frontend/` (React, Tailwind CSS, Vite).
+
+First time only:
+
+```
+cd frontend
+npm install
+```
+
+While developing, run the Go server (with `NOTES_KEY` set) in one terminal and the Vite dev server in another:
+
+```
+cd frontend
+npm run dev
+```
+
+Open the address Vite prints (usually `http://localhost:5173`). API calls are forwarded to the Go server on port 4000.
+
+To build the version the Go program serves:
+
+```
+cd frontend
+npm run build
+```
+
+This writes the compiled app into `web/`. Commit the `web/` folder, since the Go program embeds it and the Go tests expect it.
+
+## Deploy on Render
+
+1. Build the frontend (`cd frontend && npm run build`) and push the project to GitHub, including the built `web/` folder. Make sure `.env` and the key are not committed.
+2. In Render, create a **Web Service** from the repository.
+3. Settings: language **Go**, build command `go build -o app .`, start command `./app`.
+4. Add the environment variable `NOTES_KEY` with a new key (keep it fixed once notes are stored), and `MONGO_URI` with your MongoDB connection string. In Atlas, allow Render under **Network Access**. Render's free instances have no fixed IP, so `0.0.0.0/0` is the usual workaround, and the database is still protected by its username and password.
+5. After the first deploy, add `BASE_URL` set to the service address (for example `https://your-service.onrender.com`, no trailing slash).
+
+## Known limitations
+
+- **Memory mode loses notes.** Without `MONGO_URI`, notes are lost whenever the program restarts, and free hosting tiers stop idle services, so a note can disappear before it is read. Use MongoDB for anything real.
+- **Expired notes can linger briefly in MongoDB.** The TTL job runs about once a minute. The app still refuses to return an expired note during that time.
+- **The key is a single point of failure.** If `NOTES_KEY` is lost or changed, notes already stored can no longer be decrypted.
+- **Not end-to-end encrypted.** The server holds the key and sees the text when the note is created. The encryption protects stored data.
+- **No rate limiting yet.** Anyone who knows the address can create notes (within the size limits).
+- **Memory mode is single instance only.** The in-memory store is not shared between copies of the server. MongoDB mode has no such limit.
+
+## Roadmap
+
+- Rate limiting on note creation
+
+## What this project teaches
+
+- Encrypting data with AES-GCM and managing a key outside the code
+- Generating unguessable IDs with `crypto/rand`
+- Making an operation happen exactly once under concurrency
+- Designing safe HTTP semantics (why reading is a POST)
+- Background goroutines for cleanup
+- Testing HTTP handlers with `httptest`, including table-driven and concurrent tests
+- Building a React interface with Tailwind CSS and Vite, and serving the build from Go with `embed`
+- Hardening the pages with security headers and a Content Security Policy
+- Using MongoDB TTL indexes for automatic expiry, and an atomic find-and-delete for the read-once guarantee
+- Writing one set of tests that runs against two storage implementations
